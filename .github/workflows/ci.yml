@@ -1,13 +1,79 @@
-name: Java CI
-on: [push, pull_request]
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
+    name: Unit and integration tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
-      - run: mvn -B verify
+      - name: Verify
+        run: ./mvnw -B verify
+
+  docker-smoke:
+    name: Docker build and smoke test
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and start the stack
+        run: docker compose up -d --build
+      - name: Wait for the application health check
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/actuator/health | grep -q '"status":"UP"'; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+      - name: Smoke test accounts, deposit, transfer and replay
+        run: |
+          A=$(curl -fsS -X POST http://localhost:8080/api/accounts \
+            -H 'Content-Type: application/json' \
+            -d '{"ownerName":"CI Alice","currency":"USD"}')
+          B=$(curl -fsS -X POST http://localhost:8080/api/accounts \
+            -H 'Content-Type: application/json' \
+            -d '{"ownerName":"CI Bob","currency":"USD"}')
+          AID=$(echo "$A" | jq -r '.id')
+          BID=$(echo "$B" | jq -r '.id')
+          test "$AID" != "null" && test "$BID" != "null"
+
+          curl -fsS -X POST "http://localhost:8080/api/accounts/$AID/deposits" \
+            -H 'Content-Type: application/json' \
+            -H 'Idempotency-Key: ci-deposit-1' \
+            -d '{"amount":100.00}' > /dev/null
+
+          BODY="{\"fromAccountId\":$AID,\"toAccountId\":$BID,\"amount\":25.00}"
+          FIRST=$(curl -sS -o /tmp/first.json -w '%{http_code}' -X POST http://localhost:8080/api/transfers \
+            -H 'Content-Type: application/json' -H 'Idempotency-Key: ci-transfer-1' -d "$BODY")
+          REPLAY=$(curl -sS -o /tmp/replay.json -w '%{http_code}' -X POST http://localhost:8080/api/transfers \
+            -H 'Content-Type: application/json' -H 'Idempotency-Key: ci-transfer-1' -d "$BODY")
+          test "$FIRST" = "201"
+          test "$REPLAY" = "200"
+          test "$(jq -r '.id' /tmp/first.json)" = "$(jq -r '.id' /tmp/replay.json)"
+
+          curl -fsS "http://localhost:8080/api/accounts/$AID" | jq -e '.balance == 75'
+          curl -fsS "http://localhost:8080/api/accounts/$BID" | jq -e '.balance == 25'
+          curl -fsS "http://localhost:8080/api/accounts/$AID/ledger" | jq -e '.totalElements == 2'
+          curl -fsS "http://localhost:8080/api/accounts/$BID/ledger" | jq -e '.totalElements == 1'
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
